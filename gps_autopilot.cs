@@ -13,17 +13,34 @@ public void Main(string argument, UpdateType updateSource)
         return;
     }
 
+    IMyLandingGear landingGear = GetBlockWithName<IMyLandingGear>("Landing Gear");
+    if (landingGear == null)
+    {
+        Echo("Landing Gear not found");
+        return;
+    }
+
     // When the script is triggered by a player or terminal (not by the timer)
     if ((updateSource & UpdateType.Trigger) != 0 || (updateSource & UpdateType.Terminal) != 0)
     {
         if (!string.IsNullOrEmpty(argument))
         {
-            Vector3D liftOffPosition = CalculateLiftOffPosition(remoteControl);
-            remoteControl.ClearWaypoints();
-            remoteControl.AddWaypoint(liftOffPosition, "LiftOff");
-            ProcessArgument(argument, remoteControl);
-            remoteControl.SetAutoPilotEnabled(true);
-            Echo($"LiftOff Position: {liftOffPosition}");
+            if (argument.ToLower() == "raycast")
+            {
+                remoteControl.ClearWaypoints();
+                PerformRaycast(remoteControl);
+            }
+            else
+            {
+                Vector3D liftOffPosition = CalculateLiftOffPosition(remoteControl);
+                remoteControl.ClearWaypoints();
+                remoteControl.AddWaypoint(liftOffPosition, "LiftOff");
+                ProcessArgument(argument, remoteControl);
+                remoteControl.ApplyAction("CollisionAvoidance_On");
+                HandleLandingGear(landingGear);
+                remoteControl.SetAutoPilotEnabled(true);
+                Echo($"LiftOff Position: {liftOffPosition}");
+            }
         }
     }
 
@@ -33,13 +50,56 @@ public void Main(string argument, UpdateType updateSource)
         if (IsLastWaypointReached(remoteControl))
         {
             remoteControl.SetAutoPilotEnabled(false);
-            Echo("Last waypoint reached. Autopilot disabled.");
+            remoteControl.ClearWaypoints();
+            Echo("Last waypoint reached. Autopilot disabled. Waypoints cleared.");
         }
         else
         {
             Echo("Navigating to waypoint.");
         }
     }
+}
+
+// Method to handle landing gear
+private void HandleLandingGear(IMyLandingGear landingGear)
+{
+    // Turn on the landing gear to ensure it's active
+    landingGear.ApplyAction("OnOff_On");
+
+    // If the landing gear is locked, unlock it
+    if (landingGear.IsLocked)
+    {
+        landingGear.ApplyAction("Unlock");
+    }
+    else
+    {
+        // If the landing gear is not locked, and Auto-Lock is active, turn off Auto-Lock
+        // Note: There isn't a direct way to check if Auto-Lock is on, so we assume it might be on
+        landingGear.ApplyAction("Autolock_Off");
+    }
+}
+
+// Perform a raycast and add the hit point as a waypoint
+private void PerformRaycast(IMyRemoteControl remoteControl)
+{
+    IMyCameraBlock camera = GetBlockWithName<IMyCameraBlock>("Forward Camera");
+    if (camera == null)
+    {
+        Echo("Camera not found");
+        return;
+    }
+
+    MyDetectedEntityInfo hitInfo = camera.Raycast(100); // Raycast up to 10000 meters
+    if (hitInfo.IsEmpty())
+    {
+        Echo("Raycast hit nothing");
+        Echo(hitInfo.Type.ToString());
+        return;
+    }
+
+    Vector3D hitPosition = hitInfo.HitPosition.Value;
+    remoteControl.AddWaypoint(hitPosition, "Raycast Hit");
+    Echo($"Raycast waypoint added: {hitPosition}");
 }
 
 // Function to check if the last waypoint is reached
