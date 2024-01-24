@@ -1,14 +1,25 @@
 enum DroneState
 {
     Idle,
+    Liftoff,
     Leave,
     Return
 }
 
 DroneState currentState = DroneState.Idle;
 DroneState lastTaskDone = DroneState.Idle;
-
 DroneState switcherState = DroneState.Idle;
+DroneState nextTask = DroneState.Idle; // Store the next task to perform after liftoff
+
+Vector3D initialPosition;
+float liftoffHeight = 20.0f; // Desired liftoff altitude in meters
+
+private double kp = 0.1; // Proportional gain
+private double ki = 0.01; // Integral gain
+private double kd = 0.1; // Derivative gain
+
+private double integral;
+private double lastError;
 
 public Program()
 {
@@ -20,7 +31,15 @@ public void Main(string argument, UpdateType updateSource)
 {
     StringBuilder echoStringBuilder = new StringBuilder();
 
-    IMyRemoteControl remoteControl = GetBlockWithName<IMyRemoteControl>("Remote Control");
+    // Fetch the cockpit
+    IMyCockpit cockpit = GridTerminalSystem.GetBlockWithName("Cargo Drone Control Seat") as IMyCockpit;
+    if (cockpit == null)
+    {
+        Echo("Control Seat not found");
+        return;
+    }
+
+    IMyRemoteControl remoteControl = GetBlockWithName<IMyRemoteControl>("Cargo Drone Remote Control");
     if (remoteControl == null)
     {
         echoStringBuilder.AppendLine("Remote Control not found");
@@ -31,18 +50,37 @@ public void Main(string argument, UpdateType updateSource)
         PrintWaypoints(remoteControl, echoStringBuilder);
     }
 
+    
     // Retrieve the current state from the Switcher
     switcherState = GetStateFromSwitcher();
-    
-    // Update the state only if it's different from the current and the last task completed
+
     if (switcherState != currentState && switcherState != lastTaskDone)
     {
-        currentState = switcherState;
+        // Check if we are transitioning from Idle to Leave or Return
+        if (currentState == DroneState.Idle && (switcherState == DroneState.Leave || switcherState == DroneState.Return))
+        {
+            // Set currentState to Liftoff and store the next task
+            currentState = DroneState.Liftoff;
+            nextTask = switcherState;
+        }
+        // Add a check for transitioning from Leave or Return to the other state
+        else if ((currentState == DroneState.Leave || currentState == DroneState.Return) && 
+                 (switcherState == DroneState.Leave || switcherState == DroneState.Return))
+        {
+            // Transition to Liftoff before switching to the other state
+            currentState = DroneState.Liftoff;
+            nextTask = switcherState;
+        }
+        else
+        {
+            currentState = switcherState;
+        }
         echoStringBuilder.AppendLine("New State: " + currentState.ToString());
     }
-    else
+    else if (IsLastWaypointReached(remoteControl))
     {
-        echoStringBuilder.AppendLine("No new state");
+        currentState = DroneState.Idle;
+        echoStringBuilder.AppendLine("Transitioning to Idle state.");
     }
 
     // When the script is triggered by a player or terminal (not by the timer)
@@ -66,37 +104,101 @@ public void Main(string argument, UpdateType updateSource)
     if ((updateSource & UpdateType.Update100) != 0)
     {
         echoStringBuilder.AppendLine("Current state: " + currentState.ToString());
+
+        if (currentState == DroneState.Leave || currentState == DroneState.Return)
+        {
+            // Toggle connector lock when leaving
+            ToggleConnectorLock();
+            HandleLandingGear();
+        }
+
         // Process the route based on the current state
         switch (currentState)
         {
+            case DroneState.Idle:
+                echoStringBuilder.AppendLine("Idle state active");
+                remoteControl.SetAutoPilotEnabled(false);
+                break;
+
             case DroneState.Leave:
                 echoStringBuilder.AppendLine("Leave state active");
                 if (lastTaskDone != DroneState.Leave)
                 {
+                    TurnOffThrusters(remoteControl);
                     HandleLeaveState(remoteControl);
                     lastTaskDone = DroneState.Leave;
                 }
+                break;
+
+            case DroneState.Liftoff:
+                HandleLiftoffState(remoteControl);
                 break;
 
             case DroneState.Return:
                 echoStringBuilder.AppendLine("Return state active");
                 if (lastTaskDone != DroneState.Return)
                 {
+                    TurnOffThrusters(remoteControl);
                     HandleReturnState(remoteControl);
                     lastTaskDone = DroneState.Return;
                 }
                 break;
         }
     }
-    // Check if the last waypoint has been reached
-    if (IsLastWaypointReached(remoteControl))
+
+    // Write the contents of echoStringBuilder to the text panel
+    // lcd.WriteText(echoStringBuilder.ToString());
+
+    // Write the contents of echoStringBuilder to the cockpit's LCD screen
+    cockpit.GetSurface(0).WriteText(echoStringBuilder.ToString());
+}
+
+private bool IsLastWaypointReached(IMyRemoteControl remoteControl)
+{
+    List<MyWaypointInfo> waypoints = new List<MyWaypointInfo>();
+    remoteControl.GetWaypointInfo(waypoints);
+
+    if (waypoints.Count == 0)
     {
-        remoteControl.SetAutoPilotEnabled(false);
-        remoteControl.ClearWaypoints();
-        echoStringBuilder.AppendLine("Last waypoint reached. Autopilot disabled.");
+        // No waypoints means we're done
+        return true;
     }
 
-    Echo(echoStringBuilder.ToString());
+    MyWaypointInfo lastWaypoint = waypoints[waypoints.Count - 1];
+    Vector3D lastWaypointPosition = lastWaypoint.Coords;
+
+    // Get the current position of the remote control
+    Vector3D currentPosition = remoteControl.GetPosition();
+
+    // Calculate the distance to the last waypoint
+    double distanceToLastWaypoint = Vector3D.Distance(currentPosition, lastWaypointPosition);
+
+    // Define a small threshold for how close the drone needs to be to the waypoint
+    // to consider it as reached. This can be adjusted based on your needs.
+    double thresholdDistance = 5.0; // meters
+
+    return distanceToLastWaypoint < thresholdDistance;
+}
+
+
+private void ToggleConnectorLock()
+{
+    var connectors = new List<IMyShipConnector>();
+    GridTerminalSystem.GetBlockGroupWithName("Cargo Drone Connectors")?.GetBlocksOfType(connectors);
+
+    foreach (var connector in connectors)
+    {
+        if (connector.Status == MyShipConnectorStatus.Connected)
+        {
+            // If connected, unlock
+            connector.Disconnect();
+        }
+        else
+        {
+            // If not connected, try to lock
+            connector.Connect();
+        }
+    }
 }
 
 private void PrintWaypoints(IMyRemoteControl remoteControl, StringBuilder echoStringBuilder)
@@ -121,7 +223,7 @@ private void PrintWaypoints(IMyRemoteControl remoteControl, StringBuilder echoSt
 
 private DroneState GetStateFromSwitcher()
 {
-    var switcher = GridTerminalSystem.GetBlockWithName("Switcher") as IMyProgrammableBlock;
+    var switcher = GridTerminalSystem.GetBlockWithName("Cargo Drone Switcher") as IMyProgrammableBlock;
     if (switcher == null)
     {
         Echo("Switcher not found");
@@ -141,14 +243,10 @@ private DroneState GetStateFromSwitcher()
 
 private void HandleLeaveState(IMyRemoteControl remoteControl)
 {
-    Vector3D home, homeLiftOff, destination, destinationLiftoff;
-    if (RetrieveGpsFromCustomData(out home, out homeLiftOff, out destinationLiftoff, out destination))
+    Vector3D home, destination;
+    if (RetrieveGpsFromCustomData(out home, out destination))
     {
         remoteControl.ClearWaypoints();
-        // Add waypoints in order for leave journey
-        remoteControl.AddWaypoint(home, "Home");
-        remoteControl.AddWaypoint(homeLiftOff, "Home LiftOff");
-        remoteControl.AddWaypoint(destinationLiftoff, "Destination Liftoff");
         remoteControl.AddWaypoint(destination, "Destination");
         remoteControl.SetAutoPilotEnabled(true);
     }
@@ -161,16 +259,79 @@ private void HandleLeaveState(IMyRemoteControl remoteControl)
 }
 
 
+private void HandleLiftoffState(IMyRemoteControl remoteControl)
+{
+    double desiredHeight = 20.0; // Desired liftoff height in meters
+    if (lastTaskDone != DroneState.Liftoff)
+    {
+        // Store the initial position when first entering the liftoff state
+        initialPosition = remoteControl.GetPosition();
+        lastTaskDone = DroneState.Liftoff;
+        integral = 0.0;
+        lastError = 0.0;
+    }
+
+    Vector3D currentPosition = remoteControl.GetPosition();
+    double currentHeight = currentPosition.Y - initialPosition.Y;
+    double error = desiredHeight - currentHeight;
+    integral += error;
+    double derivative = error - lastError;
+    lastError = error;
+
+    double thrust = kp * error + ki * integral + kd * derivative;
+
+    // Clamp thrust between 0 and 1
+    thrust = Math.Max(0.0, Math.Min(thrust, 1.0));
+
+    // Apply thrust to thrusters
+    SetThrusterOverride("Cargo Drone Up Thrusters", thrust);
+
+    if (Math.Abs(error) < 1.0) // Check if the drone is close enough to the desired height
+    {
+        // Turn off thrusters
+        TurnOffThrusters(remoteControl);
+
+        // Transition to the next task (Leave or Return)
+        currentState = nextTask;
+    }
+}
+
+private void SetThrusterOverride(string group, double overrideValue)
+{
+    var thrusters = new List<IMyThrust>();
+    GridTerminalSystem.GetBlockGroupWithName(group)?.GetBlocksOfType(thrusters);
+
+    foreach (var thruster in thrusters)
+    {
+        thruster.ThrustOverridePercentage = (float)overrideValue; // Set override
+    }
+}
+
+private void TurnOffThrusters(IMyRemoteControl remoteControl)
+{
+    SetThrusterOverride("Cargo Drone Up Thrusters", 0.0);
+}
+
+
+private bool LiftoffCompleted(IMyRemoteControl remoteControl)
+{
+    Vector3D currentPosition = remoteControl.GetPosition();
+    Vector3D gravityDirection = remoteControl.GetNaturalGravity();
+    Vector3D upDirection = -Vector3D.Normalize(gravityDirection); // Upward direction
+
+    // Calculate the current altitude relative to the initial position
+    double altitudeChange = Vector3D.Dot((currentPosition - initialPosition), upDirection);
+    
+    // Check if the drone has reached the desired altitude
+    return altitudeChange >= liftoffHeight;
+}
+
 private void HandleReturnState(IMyRemoteControl remoteControl)
 {
-    Vector3D home, homeLiftOff, destination, destinationLiftoff;
-    if (RetrieveGpsFromCustomData(out home, out homeLiftOff, out destinationLiftoff, out destination))
+    Vector3D home, destination;
+    if (RetrieveGpsFromCustomData(out home, out destination))
     {
         remoteControl.ClearWaypoints();
-        // Add waypoints in reverse order for return journey
-        remoteControl.AddWaypoint(destination, "Destination");
-        remoteControl.AddWaypoint(destinationLiftoff, "Destination Liftoff");
-        remoteControl.AddWaypoint(homeLiftOff, "Home LiftOff");
         remoteControl.AddWaypoint(home, "Home");
         remoteControl.SetAutoPilotEnabled(true);
     }
@@ -183,26 +344,23 @@ private void HandleReturnState(IMyRemoteControl remoteControl)
 }
 
 
-private bool RetrieveGpsFromCustomData(out Vector3D home, out Vector3D homeLiftOff, out Vector3D destinationLiftoff, out Vector3D destination)
+private bool RetrieveGpsFromCustomData(out Vector3D home, out Vector3D destination)
 {
     string customData = Me.CustomData;
     string[] entries = customData.Split(new[] { "GPS:" }, StringSplitOptions.RemoveEmptyEntries);
 
-    home = homeLiftOff = destinationLiftoff = destination = new Vector3D();
+    home = destination = new Vector3D();
 
-    if (entries.Length < 4) // Expecting at least 4 entries
+    if (entries.Length < 2) // Expecting at least 2 entries: Home and Destination
     {
         Echo("Not enough GPS data in Custom Data.");
         return false;
     }
 
-    // The order of retrieval should match the order of appending
+    // Try parsing the first two GPS entries (assuming they are Home and Destination)
     return TryParseGpsEntry(entries[0], out home) &&
-           TryParseGpsEntry(entries[1], out homeLiftOff) &&
-           TryParseGpsEntry(entries[2], out destinationLiftoff) &&
-           TryParseGpsEntry(entries[3], out destination);
+           TryParseGpsEntry(entries[1], out destination);
 }
-
 
 private bool TryParseGpsEntry(string entry, out Vector3D coordinates)
 {
@@ -224,45 +382,21 @@ private bool TryParseGpsEntry(string entry, out Vector3D coordinates)
 
 
 
-
 // Method to handle landing gear
-private void HandleLandingGear(IMyLandingGear landingGear)
+private void HandleLandingGear()
 {
-    if (landingGear != null) {
+    var landing_gears = new List<IMyLandingGear>();
+    GridTerminalSystem.GetBlockGroupWithName("Cargo Drone Landing Gears")?.GetBlocksOfType(landing_gears);
+    
+    foreach (var landing_gear in landing_gears)
+    {
         // Turn on the landing gear to ensure it's active
-        landingGear.ApplyAction("OnOff_On");
+        landing_gear.ApplyAction("OnOff_On");
 
         // Unlock landing gear
-        landingGear.ApplyAction("Unlock");
-    }
-    else {
-        Echo("Landing Gear not found");
+        landing_gear.ApplyAction("Unlock");
     }
 }
-
-// Function to check if the last waypoint is reached
-private bool IsLastWaypointReached(IMyRemoteControl remoteControl)
-{
-    var waypoints = new List<MyWaypointInfo>();
-    remoteControl.GetWaypointInfo(waypoints); // This will fill the list with the current waypoints
-
-    // If no waypoints are present, we assume the last has been reached
-    if (waypoints.Count == 0)
-        return true;
-
-    // Alternatively, check if the drone is close enough to the last waypoint
-    MyWaypointInfo lastWaypoint = waypoints[waypoints.Count - 1];
-    double distanceToLastWaypoint = Vector3D.Distance(remoteControl.GetPosition(), lastWaypoint.Coords);
-    
-    // If the distance to the last waypoint is less than a certain threshold, consider it reached
-    if (distanceToLastWaypoint < 5.0) // Threshold distance can be changed as needed
-    {
-        return true;
-    }
-
-    return false;
-}
-
 
 private T GetBlockWithName<T>(string name) where T : class
 {
@@ -274,108 +408,56 @@ private T GetBlockWithName<T>(string name) where T : class
     return block;
 }
 
-private Vector3D CalculateLiftOffPosition(IMyRemoteControl remoteControl)
-{
-    Vector3D currentPosition = remoteControl.GetPosition();
-    Vector3D gravityVector = remoteControl.GetNaturalGravity();
-
-    // Check if the gravity vector is not zero
-    if (gravityVector.Length() > 0)
-    {
-        Vector3D directionVector = Vector3D.Normalize(gravityVector) * -1;
-        return currentPosition + (directionVector * 50); // 50 meters above the current position
-    }
-    else
-    {
-        // If there's no natural gravity, return the current position
-        // This means lift-off position will be the same as the home position
-        return currentPosition;
-    }
-}
-
-
 private void ProcessArgument(string argument, IMyRemoteControl remoteControl)
 {
     string[] args = argument.Split(new char[] { ':' });
 
-    if (args.Length < 7) // Minimum length to include at least one set of coordinates
+    if (args.Length < 4) // Minimum length to include at least one set of coordinates
     {
-        Echo("Invalid argument format. Not enough data for GPS locations.");
+        Echo("Invalid argument format. Not enough data for GPS location.");
         return;
     }
 
-    int i = 0;
-    Vector3D? destination = null;
-    Vector3D? destinationLiftoff = null;
-    int gpsCount = 0;
-
-    while (i < args.Length && gpsCount < 2) // Process only the first two sets of GPS coordinates
+    // The GPS token is expected to be the first in the array
+    if (args[0].ToLower() != "gps")
     {
-        if (args[i].ToLower() == "gps")
-        {
-            int offset = i + 2; // Skip "gps" and the name
-            Vector3D waypoint;
-            if (offset + 3 < args.Length && TryParseCoordinates(args[offset], args[offset + 1], args[offset + 2], out waypoint))
-            {
-                if (gpsCount == 0)
-                    destinationLiftoff = waypoint; // First GPS argument is destination liftoff
-                else
-                    destination = waypoint; // Second GPS argument is destination
-
-                gpsCount++;
-                i = offset + 3; // Move past the coordinates
-
-                // Skip the color code if present
-                i += SkipColorCode(args, i);
-            }
-            else
-            {
-                Echo("Invalid GPS coordinates format.");
-                return;
-            }
-        }
-        else
-        {
-            i++; // Skip to the next part
-        }
+        Echo("GPS token not found at the expected position.");
+        return;
     }
 
-    if (destination == null || destinationLiftoff == null)
+    // The GPS name is expected to be the second in the array, coordinates start from the third
+    int coordinateIndex = 2;
+
+    // Ensure there are enough parts for the coordinates
+    if (coordinateIndex + 2 >= args.Length)
     {
-        Echo("Not enough GPS coordinates provided.");
+        Echo("Incomplete GPS coordinates.");
+        return;
     }
-    else
+
+    Vector3D destination;
+    if (TryParseCoordinates(args[coordinateIndex], args[coordinateIndex + 1], args[coordinateIndex + 2], out destination))
     {
-        // Successfully processed two sets of GPS coordinates
         Vector3D currentPos = remoteControl.GetPosition(); // Current drone position (Home)
-        Vector3D liftOffPosition = CalculateLiftOffPosition(remoteControl); // Home LiftOff
 
         remoteControl.ClearWaypoints();
 
         // Append GPS data to Custom Data
-        AppendGpsToCustomData(currentPos, liftOffPosition, destinationLiftoff.Value, destination.Value);
+        AppendGpsToCustomData(currentPos, destination);
+    }
+    else
+    {
+        Echo("Invalid GPS coordinates format.");
     }
 }
 
-
-private int SkipColorCode(string[] args, int index)
-{
-    // Check if the next element looks like a color code and skip it if so
-    return (index + 1 < args.Length && args[index + 1].StartsWith("#")) ? 1 : 0;
-}
-
-private void AppendGpsToCustomData(Vector3D home, Vector3D homeLiftOff, Vector3D destinationLiftoff, Vector3D destination)
+private void AppendGpsToCustomData(Vector3D home, Vector3D destination)
 {
     string customData = "";
     customData += $"GPS:Home({home.X}:{home.Y}:{home.Z}), ";
-    customData += $"GPS:Home LiftOff({homeLiftOff.X}:{homeLiftOff.Y}:{homeLiftOff.Z}), ";
-    customData += $"GPS:Destination Liftoff({destinationLiftoff.X}:{destinationLiftoff.Y}:{destinationLiftoff.Z}), ";
     customData += $"GPS:Destination({destination.X}:{destination.Y}:{destination.Z}), ";
     Me.CustomData = customData;
 }
-
-
-
 
 private bool TryParseCoordinates(string x, string y, string z, out Vector3D result)
 {
